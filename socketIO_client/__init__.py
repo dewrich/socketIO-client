@@ -5,6 +5,7 @@ import logging
 log = logging.getLogger('socketIO_client')
 import requests
 import websocket
+import re
 from anyjson import dumps, loads
 from datetime import datetime
 from threading import Thread, Event
@@ -62,9 +63,10 @@ def make_transport(supportedTransports, allowedTransports, secure, url, sessionI
     transportClassMap = {
         'websocket': WebsocketTransport,
         'xhr-polling': XhrPollingTransport,
+        'jsonp-polling': JsonpPollingTransport
         }
     if allowedTransports is None:
-        allowedTransports = ['websocket', 'xhr-polling']
+        allowedTransports = ['websocket', 'xhr-polling', 'jsonp-polling']
     for transport in allowedTransports:
         if transport in supportedTransports and transport in transportClassMap:
             return transportClassMap[transport](secure, url, sessionID, **kwarg)
@@ -101,6 +103,7 @@ class XhrPollingTransport(object):
         self._connected = True
         self.session = requests.Session()
         self.session.cookies.update(cookies)
+        self.timeout = 2
 
     def get_seconds_since_epoch(self):
         return int(mktime(datetime.now().timetuple()))
@@ -109,7 +112,9 @@ class XhrPollingTransport(object):
         return {'t':self.get_seconds_since_epoch()}
 
     def send(self, packet):
-        resp = self.session.post(self.url, params=self.get_params(), data=packet)
+        log.debug("send(%s)" % packet)
+        resp = self.session.post(self.url, params=self.get_params(),
+                                 cookies=self.session.cookies, data=packet, timeout=2)
         return resp
 
     def close(self, reconnect=False):
@@ -126,7 +131,10 @@ class XhrPollingTransport(object):
         return self._connected
 
     def recv(self):
-        resp = self.session.get(self.url, params=self.get_params())
+        log.debug("recv(…)")
+        resp = self.session.get(self.url, params=self.get_params(),
+                                timeout=self.timeout)
+        self.timeout = None
         if resp.text.encode('utf-8').startswith(u'\ufffd'.encode('utf-8')):
             m = resp.text.encode('utf-8').split(u'\ufffd'.encode('utf-8'))
             for l, d in zip(m[1::2], m[2::2]):
@@ -136,6 +144,70 @@ class XhrPollingTransport(object):
             return
         log.debug("recv(%s)" % resp.text[:15])
         yield resp.text
+
+class JsonpPollingTransport(object):
+    # Specs as found on:
+    # http://showmetheco.de/articles/2011/8/socket-io-for-backend-developers.html
+    def __init__(self, secure, url, sessionID, cookies, **kwarg):
+        log.debug("JsonpPollingTransport(%s, %s, %s)" % (secure, url, sessionID))
+        self.url = '%s://%s/jsonp-polling/%s' % ('https' if secure
+                else 'http', url, sessionID)
+        self._connected = True
+        self.session = requests.Session()
+        self.session.cookies.update(cookies)
+        self.data_re = re.compile(r'io.j\[(\d+)\]\("(.*)"\);')
+        self.jsonpid = 0
+        self.timeout = 2
+
+    def get_seconds_since_epoch(self):
+        return int(mktime(datetime.now().timetuple()))
+
+    def get_params(self):
+        return {'t':self.get_seconds_since_epoch(),
+                'jsonp':  self.jsonpid}
+
+    def send(self, packet):
+        log.debug("send(%s)" % packet)
+        packet = "d=%s" % requests.utils.quote(packet)
+        self.session.headers['content-type'] = 'application/x-www-form-urlencoded'
+        resp = self.session.post(self.url, params=self.get_params(), data=packet)
+        return resp
+
+    def close(self, reconnect=False):
+        log.debug("[Disconnecting] Please wait…")
+        self._connected = False
+        if not reconnect:
+            params = self.get_params()
+            params.update({"disconnect": True})
+            resp = requests.get(self.url, params=params, cookies=self.session.cookies)
+            return resp.text
+
+    def connected(self):
+        return self._connected
+
+    def recv(self):
+        log.debug("recv(…)")
+        self.session.headers['content-type'] = 'application/javascript'
+        if self.timeout:
+            resp = self.session.get(self.url, params=self.get_params(), cookies=self.session.cookies, timeout=self.timeout)
+            self.timeout = None
+        else:
+            resp = self.session.get(self.url, params=self.get_params(), cookies=self.session.cookies)
+        if resp.text.encode('utf-8').startswith(u'\ufffd'.encode('utf-8')):
+            log.debug("recv(): hunked message!")
+            m = resp.text.encode('utf-8').split(u'\ufffd'.encode('utf-8'))
+            for l, d in zip(m[1::2], m[2::2]):
+                if len(d) != int(l):
+                    log.error("Invalid incoming message: declared %d chars, receipt %d chars" % (len(d), int(l)))
+                yield d
+            return
+        log.debug("recv(%s)" % resp.text)
+
+        self.jsonpid, data = self.data_re.match(resp.text).groups()
+        data = unicode.decode(data)
+
+        yield data
+
 
 class SocketIO(object):
 
@@ -150,6 +222,9 @@ class SocketIO(object):
         self.transports = transports
         self.params = kwarg
         self.cookies = cookies
+        self.__init()
+
+    def __init(self):
         self.__connect()
         self.reconnect = False
         self.pause = Event()
@@ -169,6 +244,8 @@ class SocketIO(object):
         self.heartbeatThread.cancel()
         self.namespaceThread.cancel()
         self.transport.close(reconnect)
+        if reconnect:
+            self.__init()
 
     def __connect(self):
         baseURL = '%s:%d/socket.io/%s' % (self.host, self.port, PROTOCOL)
@@ -357,6 +434,9 @@ class ListenerThread(Thread):
                     except KeyError:
                         continue
                     delegate(packetID, channelName, data)
+            except requests.exceptions.Timeout:
+                log.error("Timeout from server. Reconnecting…")
+                self.socketIO.disconnect(reconnect=True)
             except Exception, err:
                 log.exception(err)
                 continue
